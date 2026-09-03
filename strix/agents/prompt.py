@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -33,10 +34,11 @@ def _resolve_skills(
     2. ``scan_modes/<mode>`` (always), plus ``scan_modes/diff`` when the
        run is scoped to a change set — diff scope overlays the depth
        mode rather than replacing it.
-    3. ``tooling/agent_browser`` (always — every agent has shell + the
-       agent-browser CLI).
-    4. ``tooling/python`` (always — Python runs through ``exec_command``;
-       sandbox scripts can import ``caido_api`` for Caido automation).
+    3. ``tooling/agent_browser`` (every agent has shell + the agent-browser
+       CLI) and ``tooling/python`` (Python runs through ``exec_command``;
+       sandbox scripts can import ``caido_api`` for Caido automation) —
+       skipped when ``STRIX_MINIMAL_SKILLS`` is set, to shrink the system
+       prompt for context-constrained local/self-hosted models.
     5. ``analysis/counterevidence`` and ``analysis/severity_calibration``
        (always — closure discipline and severity rubric apply to every
        agent that can open or close a candidate, or file a report).
@@ -50,8 +52,9 @@ def _resolve_skills(
     ordered.append(f"scan_modes/{scan_mode}")
     if is_diff_scoped:
         ordered.append("scan_modes/diff")
-    ordered.append("tooling/agent_browser")
-    ordered.append("tooling/python")
+    if not os.environ.get("STRIX_MINIMAL_SKILLS"):
+        ordered.append("tooling/agent_browser")
+        ordered.append("tooling/python")
     ordered.append("analysis/counterevidence")
     ordered.append("analysis/severity_calibration")
     if is_root:
