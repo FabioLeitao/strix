@@ -41,7 +41,8 @@ from strix.interface.update_check import (
 from strix.interface.utils import (
     build_final_stats_text,
 )
-from strix.telemetry import posthog, scarf
+from strix.llm.warmup import start_import_warmup, wait_for_import_warmup
+from strix.telemetry import posthog, report_error, scarf, set_scan_phase
 from strix.telemetry.logging import configure_dependency_logging
 
 
@@ -134,14 +135,12 @@ def _subscription_error_hint(exc: BaseException) -> str | None:
     return None
 
 
-async def warm_up_llm(show_model_warning: bool = True) -> None:
+async def warm_up_llm() -> None:
     from agents.models.interface import ModelTracing
 
     from strix.config.models import (
-        RECOMMENDED_MODEL_NAMES,
         configure_sdk_model_defaults,
         is_known_openai_bare_model,
-        is_recommended_or_frontier_model,
     )
     from strix.core.inputs import make_model_settings
 
@@ -184,32 +183,6 @@ async def warm_up_llm(show_model_warning: bool = True) -> None:
                 ),
             )
             sys.exit(1)
-
-        if show_model_warning and raw_model and not is_recommended_or_frontier_model(raw_model):
-            warn_text = Text()
-            warn_text.append("MODEL QUALITY WARNING", style="bold yellow")
-            warn_text.append("\n\n", style="white")
-            warn_text.append(f"'{raw_model}'", style="bold cyan")
-            warn_text.append(
-                " is not a recommended frontier model for Strix.\nSecurity scans work best with:\n",
-                style="white",
-            )
-            for recommended_model in RECOMMENDED_MODEL_NAMES:
-                warn_text.append(f"• {recommended_model}\n", style="bold cyan")
-            warn_text.append(
-                "\nYou can continue, but weaker models may miss vulnerabilities "
-                "or produce lower-quality findings.",
-                style="white",
-            )
-            console.print(
-                Panel(
-                    warn_text,
-                    title="[bold white]STRIX",
-                    title_align="left",
-                    border_style="yellow",
-                    padding=(1, 2),
-                ),
-            )
 
         await preflight_model_connection(raw_model, settings=settings)
         logger.info("LLM warm-up succeeded for model %s", (llm.model or "").strip())
@@ -332,6 +305,11 @@ def display_completion_message(args: argparse.Namespace, results_path: Path) -> 
         "[#60a5fa]docs.strix.ai[/]  [dim]·[/]  "
         "[#60a5fa]discord.gg/strix-ai[/]"
     )
+    if not args.non_interactive:
+        console.print(
+            "[dim]Run a pentest in Strix Cloud[/]  [#60a5fa]app.strix.ai[/]  [dim]·[/]  "
+            "[dim]Enterprise[/]  [#60a5fa]strix.ai/demo[/]"
+        )
     console.print()
     if not args.non_interactive:
         notify_update(console)
@@ -395,15 +373,18 @@ def _bootstrap_scan(args: argparse.Namespace) -> None:
     happen inside the TUI so the interface paints immediately instead of
     waiting on a model round trip.
     """
+    set_scan_phase("preflight")
     try:
-        asyncio.run(warm_up_llm(show_model_warning=True))
+        asyncio.run(warm_up_llm())
     except ModelConnectionError as exc:
+        report_error("model_connection_failed", exc)
         _print_model_connection_error(exc, exc.model_name)
         sys.exit(1)
     persist_current()
     try:
         prepare_run(args)
     except ValueError as e:
+        report_error("scan_preparation_failed", e)
         _print_error_panel("SCAN PREPARATION FAILED", str(e))
         sys.exit(1)
     telemetry_start(args)
@@ -450,8 +431,6 @@ def main() -> None:
 
         sys.exit(run_cloud(sys.argv[2:]))
 
-    from strix.llm.warmup import start_import_warmup
-
     start_import_warmup()
 
     args = parse_arguments()
@@ -466,6 +445,9 @@ def main() -> None:
     pull_docker_image()
     validate_environment()
 
+    # Everything below imports the scan engine; do not race the warm-up thread.
+    wait_for_import_warmup()
+
     if args.non_interactive:
         _bootstrap_scan(args)
 
@@ -477,18 +459,21 @@ def main() -> None:
             from strix.interface.cli import run_cli
 
             asyncio.run(run_cli(args))
+            # Headless runs have no user to quit: the agent either finished
+            # (already beaconed as finished_by_tool) or stopped on its own.
+            exit_reason = "agent_stopped"
         else:
             asyncio.run(run_tui(args))
     except InteractiveSetupUnavailableError as exc:
         exit_reason = "error"
+        report_error("interactive_setup_unavailable", exc)
         _print_error_panel("INTERACTIVE SETUP UNAVAILABLE", str(exc))
         sys.exit(1)
     except KeyboardInterrupt:
         exit_reason = "interrupted"
-    except Exception:
+    except Exception as exc:
         exit_reason = "error"
-        posthog.error("unhandled_exception")
-        scarf.error("unhandled_exception")
+        report_error("unhandled_exception", exc)
         raise
     finally:
         report_state = get_global_report_state()

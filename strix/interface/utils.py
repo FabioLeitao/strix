@@ -19,6 +19,7 @@ from rich.panel import Panel
 from rich.text import Text
 
 from strix.config import load_settings
+from strix.telemetry import report_error
 from strix.utils.api_spec import detect_spec_format, validate_postman_uid
 from strix.utils.secret_files import write_secret_text
 
@@ -1328,6 +1329,7 @@ def collect_local_sources(targets_info: list[dict[str, Any]]) -> list[dict[str, 
                     "source_path": details["target_path"],
                     "workspace_subdir": workspace_subdir,
                     "protect_metadata": True,
+                    "read_only": bool(details.get("read_only")),
                 }
             )
 
@@ -1610,7 +1612,8 @@ def check_docker_connection() -> Any:
 
     try:
         return docker.from_env()
-    except DockerException:
+    except DockerException as exc:
+        report_error("docker_unavailable", exc)
         console = Console()
         error_text = Text()
         error_text.append("DOCKER NOT AVAILABLE", style="bold red")

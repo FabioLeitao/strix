@@ -19,6 +19,7 @@ from strix.config.settings import DEFAULT_MAX_TURNS
 from strix.interface.tui import runtime as go_tui
 from strix.interface.tui import sidecar
 from strix.interface.tui.runtime import GoTuiRuntime
+from strix.report.state import ReportState
 
 
 def args() -> argparse.Namespace:
@@ -924,6 +925,28 @@ async def test_agent_state_sync_uses_latest_graph_snapshot_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_tool_output_carries_the_status_it_parked_the_agent_in() -> None:
+    runtime = GoTuiRuntime(args())
+    await runtime.coordinator.register("root", "Strix", parent_id=None)
+    await runtime._sync_agent_state()
+    notified: list[str] = []
+    runtime.controller._on_change = lambda: notified.append(
+        runtime.live_view.agents["root"]["status"]
+    )
+
+    await runtime.coordinator.park_waiting("root", wait_kind="agents")
+    output = SimpleNamespace(
+        type="tool_call_output_item",
+        raw_item={"call_id": "call-1", "type": "function_call_output"},
+        output=json.dumps({"success": True, "wait_outcome": "waiting"}),
+    )
+    runtime.capture_event("root", SimpleNamespace(type="run_item_stream_event", item=output))
+    await asyncio.gather(*runtime._output_syncs)
+
+    assert notified == ["waiting"]
+
+
+@pytest.mark.asyncio
 async def test_agent_state_sync_projects_completed_report() -> None:
     runtime = GoTuiRuntime(args())
     runtime.report_state = cast("Any", SimpleNamespace(run_record={"status": "completed"}))
@@ -1027,3 +1050,29 @@ async def test_prepare_and_start_runs_the_scan_after_preparation(
 
     assert order == ["preflight", "persist", "prepare", "telemetry", "state", "scan"]
     assert runtime.controller.scan_state == "running"
+
+
+def test_sync_fingerprint_tracks_report_revisions(tmp_path: Path) -> None:
+    runtime = GoTuiRuntime(args())
+    runtime.report_state = ReportState(run_name="test-run")
+    runtime.report_state.vulnerability_reports = [{"id": "vuln-0001", "title": "Old title"}]
+    runtime.report_state.get_run_dir = lambda: tmp_path  # type: ignore[method-assign]
+
+    report = runtime.report_state.vulnerability_reports[0]
+    timestamp = "2026-09-09 10:00:00 UTC"
+
+    before = runtime._runtime_sync_fingerprint()
+    report.update(
+        {
+            "title": "New title",
+            "updated_at": timestamp,
+            "update_history": [{"timestamp": timestamp, "fields": ["title"]}],
+        }
+    )
+    first_revision = runtime._runtime_sync_fingerprint()
+    assert first_revision != before
+
+    report["title"] = "Newer title"
+    report["update_history"].append({"timestamp": timestamp, "fields": ["title"]})
+
+    assert runtime._runtime_sync_fingerprint() != first_revision
